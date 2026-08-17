@@ -1,0 +1,16 @@
+NAFNet v3
+Copyright (c) 2026 NAFNet v3 contributors
+
+This project builds upon the NAFNet image restoration architecture
+developed by Megvii Research.
+
+Original project:
+https://github.com/megvii-research/NAFNet
+
+Original work:
+Chen, Liangyu; Chu, Xiaojie; Zhang, Xiangyu; Sun, Jian.
+"Simple Baselines for Image Restoration."
+European Conference on Computer Vision (ECCV), 2022.
+
+NAFNet is released under the MIT License.
+Please see the original repository for the upstream license and attribution.
