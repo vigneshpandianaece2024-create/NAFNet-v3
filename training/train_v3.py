@@ -1,31 +1,31 @@
 """
 Train NAFNet v3 on mixed-resolution paired .npy data.
 
-Handles three things the earlier scripts did not:
+Handles:
 
-1. MIXED IMAGE SIZES. The combined dataset has 128x128 and 64x64 LR images.
-   With --patch 96 the 64px images can only yield 64px crops, and stacking
-   96px and 64px tensors into one batch raises a RuntimeError. A size-aware
-   batch sampler groups images of the same size into each batch, so every
-   batch is internally uniform while batches may differ from one another.
-   Nothing is padded and no data is discarded.
+1. MIXED IMAGE SIZES
+   The combined dataset contains 128x128 and 64x64 LR images.
+   With --patch 96, the 64px images can only yield 64px crops.
 
-2. MULTIPLE NOISE REALISATIONS. NoisyLR/000000_00.npy and 000000_01.npy both
-   map to GT/000000.npy. Each becomes its own pair.
+   A size-aware batch sampler groups images of the same effective crop size
+   into each batch. No padding is required and no data is discarded.
 
-3. VALIDATION SPLIT BY CLEAN IMAGE, not by pair. If the two noise versions
-   of one image landed on opposite sides of the split, the validation score
-   would be inflated - the model would have trained on that exact content.
+2. MULTIPLE NOISE REALISATIONS
+   Multiple NoisyLR files can map to the same GT clean image.
 
-Config follows options/train/SIDD/NAFNet-width32.yml:
-[2,2,4,8] encoder, 12 middle blocks, [2,2,2,2] decoder,
-AdamW betas (0.9, 0.9), weight_decay 0.
+3. CLEAN-IMAGE-LEVEL VALIDATION SPLIT
+   All noisy realisations belonging to one clean image remain on the same
+   side of the train/validation split.
 
-Usage:
+Example:
 
-    python train_v3.py --root /kaggle/working/combined \
-        --out_dir /kaggle/working/ckpt_v3 \
-        --width 32 --patch 96 --batch 8 --iters 100000
+    python training/train_v3.py \
+        --root /path/to/combined \
+        --out_dir checkpoints \
+        --width 32 \
+        --patch 96 \
+        --batch 8 \
+        --iters 100000
 """
 
 import argparse
@@ -33,16 +33,53 @@ import math
 import os
 import random
 import re
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 
+
+# ---------------------------------------------------------------------------
+# Repository import path
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(
+    __file__
+).resolve().parents[1]
+
+MODELS_DIR = REPO_ROOT / "models"
+
+if str(MODELS_DIR) not in sys.path:
+    sys.path.insert(
+        0,
+        str(MODELS_DIR)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Third-party imports
+# ---------------------------------------------------------------------------
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Sampler
 
-from nafnet_v3 import NAFNetSR, enable_tlc, disable_tlc
+from torch.utils.data import (
+    Dataset,
+    DataLoader,
+    Sampler,
+)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+from nafnet_v3 import (
+    NAFNetSR,
+    enable_tlc,
+    disable_tlc,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,29 +93,37 @@ def to_hw(a):
         return a
 
     if a.ndim == 3:
+
         if a.shape[0] == 1:
             return a[0]
 
         if a.shape[2] == 1:
             return a[:, :, 0]
 
-    raise ValueError(f"Unsupported shape {a.shape}")
+    raise ValueError(
+        f"Unsupported shape {a.shape}"
+    )
 
 
 def find_pairs(root):
     """
-    Returns [(lr_path, gt_path, gt_key)].
+    Returns:
+        [(lr_path, gt_path, gt_key)]
 
-    gt_key identifies the clean image, so pairs sharing a GT can be kept on
-    the same side of the train/val split.
+    gt_key identifies the clean image so all noisy realizations of the same
+    clean image can remain in the same train/validation split.
     """
 
     gt_d = Path(root) / "GT"
     lr_d = Path(root) / "NoisyLR"
 
     for d in (gt_d, lr_d):
+
         if not d.is_dir():
-            raise RuntimeError(f"Missing folder: {d}")
+
+            raise RuntimeError(
+                f"Missing folder: {d}"
+            )
 
     gt = {
         p.stem: p
@@ -98,6 +143,7 @@ def find_pairs(root):
     for p in lr_files:
 
         if p.stem in gt:
+
             pairs.append(
                 (
                     p,
@@ -105,11 +151,17 @@ def find_pairs(root):
                     p.stem,
                 )
             )
+
             continue
 
-        base = re.sub(r"_\d+$", "", p.stem)
+        base = re.sub(
+            r"_\d+$",
+            "",
+            p.stem,
+        )
 
         if base in gt:
+
             pairs.append(
                 (
                     p,
@@ -117,17 +169,24 @@ def find_pairs(root):
                     base,
                 )
             )
+
         else:
-            unmatched.append(p.name)
+
+            unmatched.append(
+                p.name
+            )
 
     if not pairs:
+
         raise RuntimeError(
             "Nothing matched.\n"
             f"  GT stems      : {sorted(gt)[:5]}\n"
-            f"  NoisyLR stems : {[p.stem for p in lr_files[:5]]}"
+            f"  NoisyLR stems : "
+            f"{[p.stem for p in lr_files[:5]]}"
         )
 
     if unmatched:
+
         print(
             f"  WARNING {len(unmatched)} unmatched, "
             f"e.g. {unmatched[:3]}"
@@ -141,87 +200,107 @@ def find_pairs(root):
     )
 
     print(
-        f"  {len(pairs)} pairs from {n_clean} clean images "
-        f"({len(pairs) / n_clean:.2f} noise realisations each)"
+        f"  {len(pairs)} pairs from "
+        f"{n_clean} clean images "
+        f"({len(pairs) / n_clean:.2f} "
+        f"noise realisations each)"
     )
 
     return pairs
 
 
-def scan_sizes(pairs, max_probe=4000):
+def scan_sizes(
+    pairs,
+    max_probe=4000,
+):
     """
-    Record each pair's LR size, and confirm one consistent scale factor.
+    Record each pair's LR size and confirm one consistent scale factor.
     """
 
-    sizes = []
     sfs = set()
+    seen = {}
 
     probe = (
         pairs
         if len(pairs) <= max_probe
-        else random.sample(pairs, max_probe)
+        else random.sample(
+            pairs,
+            max_probe,
+        )
     )
-
-    seen = {}
 
     for lp, gp, _ in probe:
 
         l = to_hw(
             np.load(
                 lp,
-                mmap_mode="r"
+                mmap_mode="r",
             )
         ).shape
 
         g = to_hw(
             np.load(
                 gp,
-                mmap_mode="r"
+                mmap_mode="r",
             )
         ).shape
 
-        seen[l] = seen.get(l, 0) + 1
+        seen[l] = (
+            seen.get(l, 0) + 1
+        )
 
-        if g[0] % l[0] or g[1] % l[1]:
+        if (
+            g[0] % l[0]
+            or g[1] % l[1]
+        ):
+
             raise RuntimeError(
-                f"{gp.name}: GT {g} not an integer multiple of LR {l}"
+                f"{gp.name}: "
+                f"GT {g} not an integer "
+                f"multiple of LR {l}"
             )
 
         sfs.add(
             (
                 g[0] // l[0],
-                g[1] // l[1]
+                g[1] // l[1],
             )
         )
 
     if len(sfs) > 1:
+
         raise RuntimeError(
             f"Mixed scale factors {sfs}. "
-            "The model handles ONE scale factor; "
-            "separate the data or retrain per scale."
+            "The model handles ONE scale factor."
         )
 
     sf = sfs.pop()
 
     if sf[0] != sf[1]:
+
         raise RuntimeError(
             f"Non-uniform scale {sf}"
         )
 
     print(
-        f"  LR sizes present: {dict(sorted(seen.items()))}"
+        f"  LR sizes present: "
+        f"{dict(sorted(seen.items()))}"
     )
 
     print(
-        f"  scale factor: {sf[0]}x (consistent)"
+        f"  scale factor: "
+        f"{sf[0]}x (consistent)"
     )
 
-    for lp, gp, k in pairs:
+    sizes = []
+
+    for lp, gp, _ in pairs:
+
         sizes.append(
             to_hw(
                 np.load(
                     lp,
-                    mmap_mode="r"
+                    mmap_mode="r",
                 )
             ).shape
         )
@@ -244,6 +323,7 @@ class PairDataset(Dataset):
         scale,
         train=True,
     ):
+
         self.pairs = pairs
         self.sizes = sizes
         self.patch = patch
@@ -252,14 +332,19 @@ class PairDataset(Dataset):
         self.train = train
 
     def __len__(self):
-        return len(self.pairs)
+
+        return len(
+            self.pairs
+        )
 
     def crop_size(self, idx):
+
         h, w = self.sizes[idx]
+
         return min(
             self.patch,
             h,
-            w
+            w,
         )
 
     def __getitem__(self, idx):
@@ -269,14 +354,18 @@ class PairDataset(Dataset):
         lr = (
             to_hw(
                 np.load(lp)
-            ).astype(np.float32)
+            ).astype(
+                np.float32
+            )
             / self.scale
         )
 
         gt = (
             to_hw(
                 np.load(gp)
-            ).astype(np.float32)
+            ).astype(
+                np.float32
+            )
             / self.scale
         )
 
@@ -285,22 +374,30 @@ class PairDataset(Dataset):
         p = min(
             self.patch,
             H,
-            W
+            W,
         )
 
         if self.train:
+
             top = random.randint(
                 0,
-                H - p
+                H - p,
             )
 
             left = random.randint(
                 0,
-                W - p
+                W - p,
             )
+
         else:
-            top = (H - p) // 2
-            left = (W - p) // 2
+
+            top = (
+                H - p
+            ) // 2
+
+            left = (
+                W - p
+            ) // 2
 
         s = self.sf
 
@@ -308,7 +405,7 @@ class PairDataset(Dataset):
             np.ascontiguousarray(
                 lr[
                     top:top + p,
-                    left:left + p
+                    left:left + p,
                 ]
             )
         )[None]
@@ -317,7 +414,7 @@ class PairDataset(Dataset):
             np.ascontiguousarray(
                 gt[
                     top * s:(top + p) * s,
-                    left * s:(left + p) * s
+                    left * s:(left + p) * s,
                 ]
             )
         )[None]
@@ -325,39 +422,54 @@ class PairDataset(Dataset):
         if self.train:
 
             if random.random() < 0.5:
+
                 a, b = (
-                    torch.flip(a, [2]),
-                    torch.flip(b, [2])
+                    torch.flip(
+                        a,
+                        [2],
+                    ),
+                    torch.flip(
+                        b,
+                        [2],
+                    ),
                 )
 
             if random.random() < 0.5:
+
                 a, b = (
-                    torch.flip(a, [1]),
-                    torch.flip(b, [1])
+                    torch.flip(
+                        a,
+                        [1],
+                    ),
+                    torch.flip(
+                        b,
+                        [1],
+                    ),
                 )
 
             r = random.randint(
                 0,
-                3
+                3,
             )
 
             if r:
+
                 a, b = (
                     torch.rot90(
                         a,
                         r,
-                        [1, 2]
+                        [1, 2],
                     ),
                     torch.rot90(
                         b,
                         r,
-                        [1, 2]
-                    )
+                        [1, 2],
+                    ),
                 )
 
         return (
             a.contiguous(),
-            b.contiguous()
+            b.contiguous(),
         )
 
 
@@ -368,11 +480,7 @@ class PairDataset(Dataset):
 class SameSizeBatchSampler(Sampler):
 
     """
-    Yields batches whose members all produce the same crop size.
-
-    Indices are bucketed by effective crop size, each bucket is shuffled and
-    chunked into batches, then the batches themselves are shuffled so the
-    model does not see all 64px batches before all 96px ones.
+    Groups samples with the same effective crop size into each batch.
     """
 
     def __init__(
@@ -382,14 +490,20 @@ class SameSizeBatchSampler(Sampler):
         shuffle=True,
         drop_last=True,
     ):
+
         self.ds = dataset
         self.bs = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
 
-        self.buckets = defaultdict(list)
+        self.buckets = defaultdict(
+            list
+        )
 
-        for i in range(len(dataset)):
+        for i in range(
+            len(dataset)
+        ):
+
             self.buckets[
                 dataset.crop_size(i)
             ].append(i)
@@ -402,7 +516,8 @@ class SameSizeBatchSampler(Sampler):
         }
 
         print(
-            f"  crop-size buckets: {counts}"
+            f"  crop-size buckets: "
+            f"{counts}"
         )
 
     def __iter__(self):
@@ -414,12 +529,15 @@ class SameSizeBatchSampler(Sampler):
             idxs = idxs[:]
 
             if self.shuffle:
-                random.shuffle(idxs)
+
+                random.shuffle(
+                    idxs
+                )
 
             for i in range(
                 0,
                 len(idxs),
-                self.bs
+                self.bs,
             ):
 
                 b = idxs[
@@ -430,12 +548,20 @@ class SameSizeBatchSampler(Sampler):
                     len(b) == self.bs
                     or not self.drop_last
                 ):
-                    batches.append(b)
+
+                    batches.append(
+                        b
+                    )
 
         if self.shuffle:
-            random.shuffle(batches)
 
-        return iter(batches)
+            random.shuffle(
+                batches
+            )
+
+        return iter(
+            batches
+        )
 
     def __len__(self):
 
@@ -444,10 +570,17 @@ class SameSizeBatchSampler(Sampler):
         for idxs in self.buckets.values():
 
             if self.drop_last:
-                n += len(idxs) // self.bs
+
+                n += (
+                    len(idxs)
+                    // self.bs
+                )
+
             else:
+
                 n += math.ceil(
-                    len(idxs) / self.bs
+                    len(idxs)
+                    / self.bs
                 )
 
         return n
@@ -457,51 +590,74 @@ class SameSizeBatchSampler(Sampler):
 # Losses
 # ---------------------------------------------------------------------------
 
-def gradient_loss(p, t):
+def gradient_loss(
+    p,
+    t,
+):
 
     horizontal = F.l1_loss(
-        p[..., :, 1:] - p[..., :, :-1],
-        t[..., :, 1:] - t[..., :, :-1]
+        p[..., :, 1:]
+        - p[..., :, :-1],
+
+        t[..., :, 1:]
+        - t[..., :, :-1],
     )
 
     vertical = F.l1_loss(
-        p[..., 1:, :] - p[..., :-1, :],
-        t[..., 1:, :] - t[..., :-1, :]
+        p[..., 1:, :]
+        - p[..., :-1, :],
+
+        t[..., 1:, :]
+        - t[..., :-1, :],
     )
 
-    return horizontal + vertical
+    return (
+        horizontal
+        + vertical
+    )
 
 
-def fft_loss(p, t):
+def fft_loss(
+    p,
+    t,
+):
 
     return F.l1_loss(
         torch.abs(
             torch.fft.rfft2(
                 p.float(),
-                norm="ortho"
+                norm="ortho",
             )
         ),
+
         torch.abs(
             torch.fft.rfft2(
                 t.float(),
-                norm="ortho"
+                norm="ortho",
             )
-        )
+        ),
     )
 
 
-def psnr(a, b):
+def psnr(
+    a,
+    b,
+):
 
     mse = F.mse_loss(
         a.clamp(0, 1),
-        b.clamp(0, 1)
+        b.clamp(0, 1),
     ).item()
 
     if mse == 0:
+
         return 100.0
 
-    return 10 * math.log10(
-        1.0 / mse
+    return (
+        10
+        * math.log10(
+            1.0 / mse
+        )
     )
 
 
@@ -519,36 +675,43 @@ def evaluate(
 
     model.eval()
 
-    tot = 0
-    base = 0
+    total_psnr = 0.0
+    baseline_psnr = 0.0
     n = 0
 
     for lr, gt in loader:
 
-        lr = lr.to(device)
-        gt = gt.to(device)
+        lr = lr.to(
+            device
+        )
 
-        out = model(lr)
+        gt = gt.to(
+            device
+        )
 
-        bas = F.interpolate(
+        out = model(
+            lr
+        )
+
+        baseline = F.interpolate(
             lr,
             scale_factor=sf,
             mode="bilinear",
-            align_corners=False
+            align_corners=False,
         )
 
         for i in range(
             out.size(0)
         ):
 
-            tot += psnr(
+            total_psnr += psnr(
                 out[i],
-                gt[i]
+                gt[i],
             )
 
-            base += psnr(
-                bas[i],
-                gt[i]
+            baseline_psnr += psnr(
+                baseline[i],
+                gt[i],
             )
 
             n += 1
@@ -556,109 +719,112 @@ def evaluate(
     model.train()
 
     return (
-        tot / max(n, 1),
-        base / max(n, 1)
+        total_psnr / max(n, 1),
+        baseline_psnr / max(n, 1),
     )
 
 
 # ---------------------------------------------------------------------------
-# Main training function
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
 
-    ap = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
 
-    ap.add_argument(
+    parser.add_argument(
         "--root",
-        required=True
+        required=True,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--out_dir",
-        default="ckpt_v3"
+        default="ckpt_v3",
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--width",
         type=int,
-        default=32
+        default=32,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--patch",
         type=int,
-        default=96
+        default=96,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--batch",
         type=int,
-        default=8
+        default=8,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--iters",
         type=int,
-        default=100000
+        default=100000,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--lr",
         type=float,
-        default=3e-4
+        default=3e-4,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--weight_decay",
         type=float,
-        default=0.0
+        default=0.0,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--lambda_grad",
         type=float,
-        default=0.1
+        default=0.1,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--lambda_fft",
         type=float,
-        default=0.1
+        default=0.1,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--val_frac",
         type=float,
-        default=0.03
+        default=0.03,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--eval_every",
         type=int,
-        default=1000
+        default=1000,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--workers",
         type=int,
-        default=2
+        default=2,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--resume",
-        default=None
+        default=None,
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--sf",
         type=int,
-        default=0
+        default=0,
     )
 
-    args = ap.parse_args()
+    args = parser.parse_args()
 
+    # -----------------------------------------------------------------------
     # Reproducibility
+    # -----------------------------------------------------------------------
+
     random.seed(0)
     torch.manual_seed(0)
     np.random.seed(0)
@@ -700,7 +866,8 @@ def main():
     )
 
     print(
-        f"  normalisation divisor: {scale}"
+        f"  normalisation divisor: "
+        f"{scale}"
     )
 
     if device == "cuda":
@@ -720,7 +887,7 @@ def main():
         )
 
     # -----------------------------------------------------------------------
-    # Split by CLEAN IMAGE
+    # Clean-image-level split
     # -----------------------------------------------------------------------
 
     keys = sorted(
@@ -737,8 +904,9 @@ def main():
     n_val_keys = max(
         1,
         int(
-            len(keys) * args.val_frac
-        )
+            len(keys)
+            * args.val_frac
+        ),
     )
 
     val_keys = set(
@@ -747,13 +915,15 @@ def main():
 
     tr_idx = [
         i
-        for i, (_, _, k) in enumerate(pairs)
+        for i, (_, _, k)
+        in enumerate(pairs)
         if k not in val_keys
     ]
 
     va_idx = [
         i
-        for i, (_, _, k) in enumerate(pairs)
+        for i, (_, _, k)
+        in enumerate(pairs)
         if k in val_keys
     ]
 
@@ -780,7 +950,8 @@ def main():
     print(
         f"  train {len(tr_pairs)} pairs | "
         f"val {len(va_pairs)} pairs "
-        f"from {len(val_keys)} held-out clean images"
+        f"from {len(val_keys)} "
+        f"held-out clean images"
     )
 
     # -----------------------------------------------------------------------
@@ -793,7 +964,7 @@ def main():
         args.patch,
         sf,
         scale,
-        True
+        True,
     )
 
     val_ds = PairDataset(
@@ -802,18 +973,22 @@ def main():
         args.patch,
         sf,
         scale,
-        False
+        False,
     )
 
     train_loader = DataLoader(
         train_ds,
         batch_sampler=SameSizeBatchSampler(
             train_ds,
-            args.batch
+            args.batch,
         ),
         num_workers=args.workers,
-        pin_memory=(device == "cuda"),
-        persistent_workers=args.workers > 0
+        pin_memory=(
+            device == "cuda"
+        ),
+        persistent_workers=(
+            args.workers > 0
+        ),
     )
 
     val_loader = DataLoader(
@@ -822,12 +997,12 @@ def main():
             val_ds,
             max(
                 1,
-                args.batch // 2
+                args.batch // 2,
             ),
             shuffle=False,
-            drop_last=False
+            drop_last=False,
         ),
-        num_workers=args.workers
+        num_workers=args.workers,
     )
 
     # -----------------------------------------------------------------------
@@ -836,11 +1011,12 @@ def main():
 
     model = NAFNetSR(
         sf=sf,
-        width=args.width
+        width=args.width,
     ).to(device)
 
-    # Global pooling during training.
-    disable_tlc(model)
+    disable_tlc(
+        model
+    )
 
     print(
         f"\nparams "
@@ -862,20 +1038,22 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # Optimizer and scheduler
+    # Optimizer
     # -----------------------------------------------------------------------
 
-    opt = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.9),
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
     )
 
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt,
-        T_max=args.iters,
-        eta_min=1e-7
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.iters,
+            eta_min=1e-7,
+        )
     )
 
     use_amp = (
@@ -884,7 +1062,7 @@ def main():
 
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=use_amp
+        enabled=use_amp,
     )
 
     # -----------------------------------------------------------------------
@@ -893,40 +1071,43 @@ def main():
 
     os.makedirs(
         args.out_dir,
-        exist_ok=True
+        exist_ok=True,
     )
 
-    it = 0
+    iteration = 0
     best = -1.0
 
     if args.resume:
 
-        ck = torch.load(
+        checkpoint = torch.load(
             args.resume,
-            map_location=device
+            map_location=device,
+            weights_only=False,
         )
 
         model.load_state_dict(
-            ck["model"]
+            checkpoint["model"]
         )
 
-        opt.load_state_dict(
-            ck["opt"]
+        optimizer.load_state_dict(
+            checkpoint["opt"]
         )
 
-        sched.load_state_dict(
-            ck["sched"]
+        scheduler.load_state_dict(
+            checkpoint["sched"]
         )
 
-        it = ck["iter"]
+        iteration = checkpoint[
+            "iter"
+        ]
 
-        best = ck.get(
+        best = checkpoint.get(
             "best",
-            -1.0
+            -1.0,
         )
 
         print(
-            f"resumed @ {it}, "
+            f"resumed @ {iteration}, "
             f"best {best:.2f} dB"
         )
 
@@ -934,77 +1115,80 @@ def main():
     # Initial validation
     # -----------------------------------------------------------------------
 
-    v, b = evaluate(
+    val_psnr, baseline_psnr = evaluate(
         model,
         val_loader,
         device,
-        sf
+        sf,
     )
 
     print(
         f"before training: "
-        f"{v:.2f} dB | "
-        f"bilinear baseline {b:.2f} dB\n"
+        f"{val_psnr:.2f} dB | "
+        f"bilinear baseline "
+        f"{baseline_psnr:.2f} dB\n"
     )
 
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
 
-    t0 = time.time()
+    start_time = time.time()
 
-    rl = 0.0
-    rg = 0.0
-    rf = 0.0
+    running_l1 = 0.0
+    running_grad = 0.0
+    running_fft = 0.0
 
-    while it < args.iters:
+    while iteration < args.iters:
 
         for lr_img, gt_img in train_loader:
 
-            if it >= args.iters:
+            if iteration >= args.iters:
                 break
 
             lr_img = lr_img.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             gt_img = gt_img.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             with torch.amp.autocast(
                 "cuda",
-                enabled=use_amp
+                enabled=use_amp,
             ):
 
-                out = model(
+                output = model(
                     lr_img
                 )
 
-                l1 = F.l1_loss(
-                    out,
-                    gt_img
+                loss_l1 = F.l1_loss(
+                    output,
+                    gt_img,
                 )
 
-                lg = gradient_loss(
-                    out,
-                    gt_img
+                loss_grad = gradient_loss(
+                    output,
+                    gt_img,
                 )
 
-                lf = fft_loss(
-                    out,
-                    gt_img
+                loss_fft = fft_loss(
+                    output,
+                    gt_img,
                 )
 
                 loss = (
-                    l1
-                    + args.lambda_grad * lg
-                    + args.lambda_fft * lf
+                    loss_l1
+                    + args.lambda_grad
+                    * loss_grad
+                    + args.lambda_fft
+                    * loss_fft
                 )
 
-            opt.zero_grad(
+            optimizer.zero_grad(
                 set_to_none=True
             )
 
@@ -1013,129 +1197,150 @@ def main():
             ).backward()
 
             scaler.unscale_(
-                opt
+                optimizer
             )
 
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                1.0
+                1.0,
             )
 
             scaler.step(
-                opt
+                optimizer
             )
 
             scaler.update()
 
-            sched.step()
+            scheduler.step()
 
-            rl += l1.item()
-            rg += lg.detach().item()
-            rf += lf.detach().item()
+            running_l1 += (
+                loss_l1.item()
+            )
 
-            it += 1
+            running_grad += (
+                loss_grad.detach().item()
+            )
+
+            running_fft += (
+                loss_fft.detach().item()
+            )
+
+            iteration += 1
 
             # ---------------------------------------------------------------
-            # Training log every 100 iterations
+            # Training log
             # ---------------------------------------------------------------
 
-            if it % 100 == 0:
+            if iteration % 100 == 0:
 
-                print(
-                    f"iter {it:7d}  "
-                    f"L1 {rl / 100:.4f}  "
-                    f"grad {rg / 100:.4f}  "
-                    f"fft {rf / 100:.4f}  "
-                    f"lr {sched.get_last_lr()[0]:.2e}  "
-                    f"{(time.time() - t0) / 100:.3f}s/it"
+                elapsed = (
+                    time.time()
+                    - start_time
                 )
 
-                rl = 0.0
-                rg = 0.0
-                rf = 0.0
+                print(
+                    f"iter {iteration:7d}  "
+                    f"L1 {running_l1 / 100:.4f}  "
+                    f"grad {running_grad / 100:.4f}  "
+                    f"fft {running_fft / 100:.4f}  "
+                    f"lr {scheduler.get_last_lr()[0]:.2e}  "
+                    f"{elapsed / 100:.3f}s/it"
+                )
 
-                t0 = time.time()
+                running_l1 = 0.0
+                running_grad = 0.0
+                running_fft = 0.0
+
+                start_time = time.time()
 
             # ---------------------------------------------------------------
-            # Validation and checkpoint every eval_every iterations
+            # Validation and checkpoint
             # ---------------------------------------------------------------
 
-            if it % args.eval_every == 0:
+            if iteration % args.eval_every == 0:
 
-                v, b = evaluate(
+                val_psnr, baseline_psnr = evaluate(
                     model,
                     val_loader,
                     device,
-                    sf
+                    sf,
                 )
 
-                ck = {
+                checkpoint = {
                     "model": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "sched": sched.state_dict(),
-                    "iter": it,
+                    "opt": optimizer.state_dict(),
+                    "sched": scheduler.state_dict(),
+                    "iter": iteration,
                     "best": best,
                     "sf": sf,
                     "scale": scale,
                     "train_patch": args.patch,
-                    "cfg": dict(
-                        middle_blk_num=12,
-                        enc_blk_nums=(
-                            2,
-                            2,
-                            4,
-                            8
-                        ),
-                        dec_blk_nums=(
-                            2,
-                            2,
-                            2,
-                            2
-                        )
-                    ),
-                    "args": vars(args)
+                    "width": args.width,
+                    "enc_blks": [
+                        2,
+                        2,
+                        4,
+                        8,
+                    ],
+                    "middle_blks": 12,
+                    "dec_blks": [
+                        2,
+                        2,
+                        2,
+                        2,
+                    ],
+                    "args": vars(args),
                 }
 
                 flag = ""
 
-                if v > best:
+                if val_psnr > best:
 
-                    best = v
-                    ck["best"] = v
+                    best = val_psnr
+
+                    checkpoint[
+                        "best"
+                    ] = best
 
                     torch.save(
-                        ck,
+                        checkpoint,
                         os.path.join(
                             args.out_dir,
-                            "best.pth"
-                        )
+                            "best.pth",
+                        ),
                     )
 
                     flag = "  *saved*"
 
                 torch.save(
-                    ck,
+                    checkpoint,
                     os.path.join(
                         args.out_dir,
-                        "last.pth"
-                    )
+                        "last.pth",
+                    ),
                 )
 
                 print(
-                    f"  >> val {v:.2f} dB  "
-                    f"(baseline {b:.2f}, "
-                    f"best {best:.2f})"
+                    f"  >> val "
+                    f"{val_psnr:.2f} dB  "
+                    f"(baseline "
+                    f"{baseline_psnr:.2f}, "
+                    f"best "
+                    f"{best:.2f})"
                     f"{flag}"
                 )
 
-                t0 = time.time()
+                start_time = time.time()
 
     print(
         f"\ndone. "
-        f"best val PSNR {best:.2f} dB"
+        f"best val PSNR "
+        f"{best:.2f} dB"
     )
 
 
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
