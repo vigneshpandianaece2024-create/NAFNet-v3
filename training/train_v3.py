@@ -1,5 +1,5 @@
 """
-Train NAFNet v3 on mixed-resolution paired .npy data.
+Train NAFNet v3 on mixed-resolution paired .npy data
 
 Handles:
 
