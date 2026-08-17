@@ -296,14 +296,3 @@ License
 This repository is intended for research and educational use.
 
 Please review the licenses of the original NAFNet implementation and any datasets used before redistributing derivative code or data.
-
-
-
-### 9.4 Don't commit yet
-
-
-After pasting, make sure the filename says:
-
-
-```text
-README.md
