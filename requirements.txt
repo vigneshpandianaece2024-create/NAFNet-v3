@@ -1,4 +1,16 @@
+# NAFNet v3 dependencies
+
+# Python
+# Recommended: Python 3.10 or newer
+
+# Deep learning
 torch
+
+# Numerical computing
 numpy
+
+# Image loading and saving
 Pillow
+
+# Perceptual image metric
 lpips
