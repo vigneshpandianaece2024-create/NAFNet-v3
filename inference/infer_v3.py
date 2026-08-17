@@ -381,76 +381,86 @@ def build_model(
     """
     Load NAFNet v3 from a training checkpoint.
 
-    Architecture information is read from the checkpoint when available.
+    The training checkpoint stores the architecture configuration,
+    training patch size, scale factor, and training metadata.
     """
 
-    ck = torch.load(
+    checkpoint = torch.load(
         ckpt_path,
         map_location=device,
         weights_only=False,
     )
 
-    args_from_ckpt = ck.get(
+    # ---------------------------------------------------------------
+    # Read architecture metadata
+    # ---------------------------------------------------------------
+
+    checkpoint_args = checkpoint.get(
         "args",
         {},
     )
 
-    sf = ck.get(
+    sf = checkpoint.get(
         "sf",
-        args_from_ckpt.get(
+        checkpoint_args.get(
             "sf",
             2,
         ),
     )
 
-    width = ck.get(
+    width = checkpoint.get(
         "width",
-        args_from_ckpt.get(
+        checkpoint_args.get(
             "width",
             32,
         ),
     )
 
-    enc_blks = ck.get(
+    enc_blks = checkpoint.get(
         "enc_blks",
-        args_from_ckpt.get(
-            "enc_blks",
-            [2, 2, 4, 8],
-        ),
+        [
+            2,
+            2,
+            4,
+            8,
+        ],
     )
 
-    middle_blks = ck.get(
+    middle_blks = checkpoint.get(
         "middle_blks",
-        args_from_ckpt.get(
-            "middle_blks",
-            12,
-        ),
+        12,
     )
 
-    dec_blks = ck.get(
+    dec_blks = checkpoint.get(
         "dec_blks",
-        args_from_ckpt.get(
-            "dec_blks",
-            [2, 2, 2, 2],
-        ),
+        [
+            2,
+            2,
+            2,
+            2,
+        ],
     )
 
-    train_patch = ck.get(
+    train_patch = checkpoint.get(
         "train_patch",
-        args_from_ckpt.get(
+        checkpoint_args.get(
             "patch",
             96,
         ),
     )
 
-    val_psnr = ck.get(
-        "best",
-        float("nan"),
-    )
+    # ---------------------------------------------------------------
+    # Metadata
+    # ---------------------------------------------------------------
 
-    iteration = ck.get(
+    iteration = checkpoint.get(
         "iter",
         "?",
+    )
+
+    best_psnr = checkpoint.get(
+        "best",
+        float("nan"),
     )
 
     print(
@@ -458,39 +468,99 @@ def build_model(
     )
 
     print(
-        f"  iter {iteration}  |  "
-        f"val PSNR {val_psnr:.2f} dB"
+        f"  iteration : {iteration}"
+    )
+
+    if math.isfinite(best_psnr):
+
+        print(
+            f"  best val PSNR : "
+            f"{best_psnr:.2f} dB"
+        )
+
+    print(
+        f"  scale factor : {sf}x"
     )
 
     print(
-        f"  scale factor {sf}x  |  "
-        f"width {width}  |  "
-        f"train patch {train_patch}"
+        f"  width        : {width}"
     )
 
     print(
-        f"  encoder blocks {enc_blks}"
+        f"  train patch  : "
+        f"{train_patch}px LR"
     )
 
     print(
-        f"  middle blocks {middle_blks}"
+        f"  encoder      : "
+        f"{enc_blks}"
     )
 
     print(
-        f"  decoder blocks {dec_blks}"
+        f"  middle       : "
+        f"{middle_blks}"
     )
+
+    print(
+        f"  decoder      : "
+        f"{dec_blks}"
+    )
+
+    # ---------------------------------------------------------------
+    # Build exact architecture
+    # ---------------------------------------------------------------
 
     model = NAFNetSR(
         sf=sf,
         width=width,
         middle_blk_num=middle_blks,
-        enc_blk_nums=enc_blks,
-        dec_blk_nums=dec_blks,
+        enc_blk_nums=tuple(
+            enc_blks
+        ),
+        dec_blk_nums=tuple(
+            dec_blks
+        ),
     ).to(device)
 
-    model.load_state_dict(
-        ck["model"]
+    # ---------------------------------------------------------------
+    # Load weights
+    # ---------------------------------------------------------------
+
+    state_dict = checkpoint.get(
+        "model"
     )
+
+    if state_dict is None:
+
+        raise KeyError(
+            "Checkpoint does not contain "
+            "a 'model' state_dict."
+        )
+
+    missing, unexpected = (
+        model.load_state_dict(
+            state_dict,
+            strict=False,
+        )
+    )
+
+    if missing:
+
+        raise RuntimeError(
+            "Missing model parameters:\n"
+            + "\n".join(
+                missing
+            )
+        )
+
+    if unexpected:
+
+        raise RuntimeError(
+            "Unexpected model parameters:\n"
+            + "\n".join(
+                unexpected
+            )
+        )
 
     model.eval()
 
@@ -499,7 +569,6 @@ def build_model(
         sf,
         train_patch,
     )
-
 
 # ---------------------------------------------------------------------------
 # Single-pass inference
