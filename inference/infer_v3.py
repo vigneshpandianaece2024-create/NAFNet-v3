@@ -1,1079 +1,356 @@
-"""
-NAFNet v3 inference
-===================
-
-NAFNetSR for grayscale image restoration + 2x super-resolution.
-
-Features
---------
-TLC:
-    Local-window average pooling matched to the training patch size.
-    Enabled by default. Disable with --no_tlc.
-
-Ensemble:
-    8-fold dihedral test-time augmentation
-    (4 rotations x 2 flips).
-    Enabled by default. Disable with --no_ensemble.
-
-Scoring:
-    PSNR, SSIM and LPIPS when --gt is provided.
-
-Output:
-    One PNG and one float32 NPY per input image.
-
-Examples
---------
-
-Blind inference:
-
-    python inference/infer_v3.py \
-        --ckpt checkpoints/best.pth \
-        --input /path/to/NoisyLR \
-        --out results
-
-Scored inference:
-
-    python inference/infer_v3.py \
-        --ckpt checkpoints/best.pth \
-        --input /path/to/NoisyLR \
-        --gt /path/to/GT \
-        --out results
-
-Fast inference without TLC or ensemble:
-
-    python inference/infer_v3.py \
-        --ckpt checkpoints/best.pth \
-        --input /path/to/NoisyLR \
-        --out results \
-        --no_tlc \
-        --no_ensemble
-"""
-
-import argparse
-import math
-import sys
-import time
-from pathlib import Path
-
+import os
+import zipfile
+import tempfile
+import shutil
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
-
-
-# ---------------------------------------------------------------------------
-# Make the repository's models/ directory importable
-# ---------------------------------------------------------------------------
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-MODELS_DIR = REPO_ROOT / "models"
-
-if str(MODELS_DIR) not in sys.path:
-    sys.path.insert(0, str(MODELS_DIR))
-
-from nafnet_v3 import (
-    NAFNetSR,
-    enable_tlc,
-    disable_tlc,
-)
-
-
-# ---------------------------------------------------------------------------
-# Supported input formats
-# ---------------------------------------------------------------------------
-
-EXTS = {
-    ".npy",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".bmp",
-    ".tif",
-    ".tiff",
-}
-
-
-# ---------------------------------------------------------------------------
-# Image loading
-# ---------------------------------------------------------------------------
-
-def load_image(path: Path) -> np.ndarray:
-    """
-    Load an image as float32 HxW.
-
-    NPY:
-        Loaded directly as float32.
-
-    Image files:
-        Converted to grayscale and normalized to [0, 1].
-
-    The function also collapses singleton channel dimensions.
-    """
-
-    if path.suffix.lower() == ".npy":
-
-        a = np.load(path).astype(
-            np.float32
-        )
-
-    else:
-
-        a = np.asarray(
-            Image.open(path).convert("L"),
-            dtype=np.float32,
-        ) / 255.0
-
-    # Collapse singleton dimensions.
-
-    if a.ndim == 3 and a.shape[0] == 1:
-        a = a[0]
-
-    elif a.ndim == 3 and a.shape[2] == 1:
-        a = a[..., 0]
-
-    if a.ndim != 2:
-        raise ValueError(
-            f"Unexpected array shape "
-            f"{a.shape} for {path}"
-        )
-
-    return a
-
-
-# ---------------------------------------------------------------------------
-# Output saving
-# ---------------------------------------------------------------------------
-
-def save_outputs(
-    arr: np.ndarray,
-    stem: Path,
-    save_npy: bool = True,
-):
-    """
-    Save prediction as:
-
-        <stem>.npy
-        <stem>.png
-
-    NPY is stored as float32.
-
-    PNG is clipped to [0, 1] and converted to uint8.
-    """
-
-    arr_clipped = np.clip(
-        arr,
-        0.0,
-        1.0,
-    )
-
-    if save_npy:
-
-        np.save(
-            str(stem) + ".npy",
-            arr.astype(np.float32),
-        )
-
-    Image.fromarray(
-        (
-            arr_clipped * 255.0
-        )
-        .round()
-        .astype(np.uint8)
-    ).save(
-        str(stem) + ".png"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def psnr(
-    pred: np.ndarray,
-    gt: np.ndarray,
-) -> float:
-
-    pred = np.clip(
-        pred,
-        0,
-        1,
-    )
-
-    gt = np.clip(
-        gt,
-        0,
-        1,
-    )
-
-    mse = float(
-        np.mean(
-            (pred - gt) ** 2
-        )
-    )
-
-    if mse == 0:
-        return 100.0
-
-    return 10.0 * math.log10(
-        1.0 / mse
-    )
-
-
-def ssim_score(
-    pred: np.ndarray,
-    gt: np.ndarray,
-) -> float:
-    """
-    Simple single-scale SSIM.
-
-    This implementation avoids requiring scikit-image.
-    """
-
-    p = np.clip(
-        pred,
-        0,
-        1,
-    ).astype(np.float64)
-
-    g = np.clip(
-        gt,
-        0,
-        1,
-    ).astype(np.float64)
-
-    C1 = (
-        0.01 * 1
-    ) ** 2
-
-    C2 = (
-        0.03 * 1
-    ) ** 2
-
-    mu_p = p.mean()
-    mu_g = g.mean()
-
-    sig_p = p.var()
-    sig_g = g.var()
-
-    sig_pg = (
-        (p - mu_p)
-        * (g - mu_g)
-    ).mean()
-
-    numerator = (
-        (2 * mu_p * mu_g + C1)
-        * (2 * sig_pg + C2)
-    )
-
-    denominator = (
-        (mu_p ** 2 + mu_g ** 2 + C1)
-        * (sig_p + sig_g + C2)
-    )
-
-    return float(
-        numerator / denominator
-    )
-
-
-# ---------------------------------------------------------------------------
-# LPIPS
-# ---------------------------------------------------------------------------
-
-_lpips_fn = None
-
-
-def lpips_score(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    device: str,
-) -> float:
-    """
-    Compute LPIPS using the AlexNet backbone.
-
-    LPIPS expects 3-channel input in [-1, 1].
-    Grayscale images are replicated across three channels.
-    """
-
-    global _lpips_fn
-
-    if _lpips_fn is None:
-
-        try:
-
-            import lpips as lpips_lib
-
-        except ImportError:
-
-            import subprocess
-
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "lpips",
-                    "-q",
-                ]
-            )
-
-            import lpips as lpips_lib
-
-        _lpips_fn = (
-            lpips_lib.LPIPS(
-                net="alex",
-                verbose=False,
-            )
-            .to(device)
-        )
-
-    def to_tensor(a):
-
-        t = torch.from_numpy(
-            np.clip(
-                a,
-                0,
-                1,
-            ).astype(
-                np.float32
-            )
-        )
-
-        # [H,W]
-        # -> [1,1,H,W]
-        # -> [1,3,H,W]
-        # -> [-1,1]
-
-        t = (
-            t.unsqueeze(0)
-            .unsqueeze(0)
-            .repeat(
-                1,
-                3,
-                1,
-                1,
-            )
-            * 2.0
-            - 1.0
-        )
-
-        return t.to(device)
-
-    with torch.no_grad():
-
-        distance = _lpips_fn(
-            to_tensor(pred),
-            to_tensor(gt),
-        )
-
-    return float(
-        distance.item()
-    )
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def build_model(
-    ckpt_path: str,
-    device: str,
-):
-    """
-    Load NAFNet v3 from a training checkpoint.
-
-    The training checkpoint stores the architecture configuration,
-    training patch size, scale factor, and training metadata.
-    """
-
-    checkpoint = torch.load(
-        ckpt_path,
-        map_location=device,
-        weights_only=False,
-    )
-
-    # ---------------------------------------------------------------
-    # Read architecture metadata
-    # ---------------------------------------------------------------
-
-    checkpoint_args = checkpoint.get(
-        "args",
-        {},
-    )
-
-    sf = checkpoint.get(
-        "sf",
-        checkpoint_args.get(
-            "sf",
-            2,
-        ),
-    )
-
-    width = checkpoint.get(
-        "width",
-        checkpoint_args.get(
-            "width",
-            32,
-        ),
-    )
-
-    enc_blks = checkpoint.get(
-        "enc_blks",
-        [
-            2,
-            2,
-            4,
-            8,
-        ],
-    )
-
-    middle_blks = checkpoint.get(
-        "middle_blks",
-        12,
-    )
-
-    dec_blks = checkpoint.get(
-        "dec_blks",
-        [
-            2,
-            2,
-            2,
-            2,
-        ],
-    )
-
-    train_patch = checkpoint.get(
-        "train_patch",
-        checkpoint_args.get(
-            "patch",
-            96,
-        ),
-    )
-
-    # ---------------------------------------------------------------
-    # Metadata
-    # ---------------------------------------------------------------
-
-    iteration = checkpoint.get(
-        "iter",
-        "?",
-    )
-
-    best_psnr = checkpoint.get(
-        "best",
-        float("nan"),
-    )
-
-    print(
-        f"Checkpoint : {ckpt_path}"
-    )
-
-    print(
-        f"  iteration : {iteration}"
-    )
-
-    if math.isfinite(best_psnr):
-
-        print(
-            f"  best val PSNR : "
-            f"{best_psnr:.2f} dB"
-        )
-
-    print(
-        f"  scale factor : {sf}x"
-    )
-
-    print(
-        f"  width        : {width}"
-    )
-
-    print(
-        f"  train patch  : "
-        f"{train_patch}px LR"
-    )
-
-    print(
-        f"  encoder      : "
-        f"{enc_blks}"
-    )
-
-    print(
-        f"  middle       : "
-        f"{middle_blks}"
-    )
-
-    print(
-        f"  decoder      : "
-        f"{dec_blks}"
-    )
-
-    # ---------------------------------------------------------------
-    # Build exact architecture
-    # ---------------------------------------------------------------
-
-    model = NAFNetSR(
-        sf=sf,
-        width=width,
-        middle_blk_num=middle_blks,
-        enc_blk_nums=tuple(
-            enc_blks
-        ),
-        dec_blk_nums=tuple(
-            dec_blks
-        ),
-    ).to(device)
-
-    # ---------------------------------------------------------------
-    # Load weights
-    # ---------------------------------------------------------------
-
-    state_dict = checkpoint.get(
-        "model"
-    )
-
-    if state_dict is None:
-
-        raise KeyError(
-            "Checkpoint does not contain "
-            "a 'model' state_dict."
-        )
-
-    missing, unexpected = (
-        model.load_state_dict(
-            state_dict,
-            strict=False,
-        )
-    )
-
-    if missing:
-
-        raise RuntimeError(
-            "Missing model parameters:\n"
-            + "\n".join(
-                missing
-            )
-        )
-
-    if unexpected:
-
-        raise RuntimeError(
-            "Unexpected model parameters:\n"
-            + "\n".join(
-                unexpected
-            )
-        )
-
-    model.eval()
-
-    return (
-        model,
-        sf,
-        train_patch,
-    )
-
-# ---------------------------------------------------------------------------
-# Single-pass inference
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def run_single(
-    model,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Forward pass for one [1,1,H,W] tensor.
-    """
-
-    return model(x)
-
-
-# ---------------------------------------------------------------------------
-# 8-fold dihedral ensemble
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def run_ensemble(
-    model,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """
-    8-fold dihedral test-time ensemble:
-
-        4 rotations x 2 flips
-
-    Each prediction is transformed back to the original orientation
-    before averaging.
-    """
-
-    outputs = []
-
-    for k in range(4):
-
-        for flip in (
-            False,
-            True,
-        ):
-
-            transformed = torch.rot90(
-                x,
-                k,
-                dims=[2, 3],
-            )
-
-            if flip:
-
-                transformed = torch.flip(
-                    transformed,
-                    dims=[3],
-                )
-
-            prediction = model(
-                transformed
-            )
-
-            if flip:
-
-                prediction = torch.flip(
-                    prediction,
-                    dims=[3],
-                )
-
-            prediction = torch.rot90(
-                prediction,
-                -k,
-                dims=[2, 3],
-            )
-
-            outputs.append(
-                prediction
-            )
-
-    return torch.stack(
-        outputs
-    ).mean(0)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# 1. EMBEDDED NAFNET v3 ARCHITECTURE 
+# ==============================================================================
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.eps = eps
+
+    def forward(self, x):
+        mu = x.mean(dim=1, keepdim=True)
+        var = (x - mu).pow(2).mean(dim=1, keepdim=True)
+        x = (x - mu) / torch.sqrt(var + self.eps)
+        return x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        a, b = x.chunk(2, dim=1)
+        return a * b
+
+class LocalAvgPool2d(nn.Module):
+    def __init__(self, base_size=None):
+        super().__init__()
+        self.base_size = base_size
+
+    def forward(self, x):
+        if self.base_size is None:
+            return F.adaptive_avg_pool2d(x, 1)
+        h, w = x.shape[-2:]
+        kh, kw = min(self.base_size, h), min(self.base_size, w)
+        if kh >= h and kw >= w:
+            return F.adaptive_avg_pool2d(x, 1)
+        s = torch.cumsum(torch.cumsum(x, dim=-1), dim=-2)
+        s = F.pad(s, (1, 0, 1, 0))
+        out = (s[..., kh:, kw:] + s[..., :-kh, :-kw]
+               - s[..., :-kh, kw:] - s[..., kh:, :-kw]) / (kh * kw)
+        return F.pad(out, (kw // 2, (kw - 1) // 2, kh // 2, (kh - 1) // 2),
+                     mode='replicate')
+
+class NAFBlock(nn.Module):
+    def __init__(self, c, dw_expand=2, ffn_expand=2, drop_out_rate=0.0):
+        super().__init__()
+        dw_c, ffn_c = c * dw_expand, c * ffn_expand
+
+        self.norm1 = LayerNorm2d(c)
+        self.conv1 = nn.Conv2d(c, dw_c, 1)
+        self.conv2 = nn.Conv2d(dw_c, dw_c, 3, padding=1, groups=dw_c)
+        self.sg = SimpleGate()
+        self.pool = LocalAvgPool2d()
+        self.sca_conv = nn.Conv2d(dw_c // 2, dw_c // 2, 1)
+        self.conv3 = nn.Conv2d(dw_c // 2, c, 1)
+
+        self.norm2 = LayerNorm2d(c)
+        self.conv4 = nn.Conv2d(c, ffn_c, 1)
+        self.conv5 = nn.Conv2d(ffn_c // 2, c, 1)
+
+        self.drop1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0 else nn.Identity()
+        self.drop2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0 else nn.Identity()
+
+        self.beta = nn.Parameter(torch.zeros(1, c, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, c, 1, 1))
+
+    def forward(self, inp):
+        x = self.norm1(inp)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.sg(x)
+        x = x * self.sca_conv(self.pool(x))
+        x = self.conv3(x)
+        y = inp + self.drop1(x) * self.beta
+
+        x = self.norm2(y)
+        x = self.conv4(x)
+        x = self.sg(x)
+        x = self.conv5(x)
+        return y + self.drop2(x) * self.gamma
+
+class NAFNetBody(nn.Module):
+    def __init__(self, in_channels=1, out_channels=32, width=32,
+                 middle_blk_num=12, enc_blk_nums=(2, 2, 4, 8),
+                 dec_blk_nums=(2, 2, 2, 2), drop_out_rate=0.0):
+        super().__init__()
+        self.intro = nn.Conv2d(in_channels, width, 3, padding=1)
+        self.ending = nn.Conv2d(width, out_channels, 3, padding=1)
+
+        self.encoders, self.decoders = nn.ModuleList(), nn.ModuleList()
+        self.downs, self.ups = nn.ModuleList(), nn.ModuleList()
+
+        chan = width
+        for n in enc_blk_nums:
+            self.encoders.append(nn.Sequential(
+                *[NAFBlock(chan, drop_out_rate=drop_out_rate) for _ in range(n)]))
+            self.downs.append(nn.Conv2d(chan, 2 * chan, 2, stride=2))
+            chan *= 2
+
+        self.middle_blks = nn.Sequential(
+            *[NAFBlock(chan, drop_out_rate=drop_out_rate) for _ in range(middle_blk_num)])
+
+        for n in dec_blk_nums:
+            self.ups.append(nn.Sequential(
+                nn.Conv2d(chan, chan * 2, 1, bias=False), nn.PixelShuffle(2)))
+            chan //= 2
+            self.decoders.append(nn.Sequential(
+                *[NAFBlock(chan, drop_out_rate=drop_out_rate) for _ in range(n)]))
+
+        self.padder_size = 2 ** len(self.encoders)
+
+    def check_image_size(self, x):
+        _, _, h, w = x.shape
+        ph = (self.padder_size - h % self.padder_size) % self.padder_size
+        pw = (self.padder_size - w % self.padder_size) % self.padder_size
+        return F.pad(x, (0, pw, 0, ph), mode='reflect') if (ph or pw) else x
+
+    def forward(self, inp):
+        _, _, H, W = inp.shape
+        x_in = self.check_image_size(inp)
+        x = self.intro(x_in)
+
+        skips = []
+        for enc, down in zip(self.encoders, self.downs):
+            x = enc(x)
+            skips.append(x)
+            x = down(x)
+
+        x = self.middle_blks(x)
+
+        for dec, up, skip in zip(self.decoders, self.ups, skips[::-1]):
+            x = up(x)
+            x = x + skip
+            x = dec(x)
+
+        return self.ending(x)[:, :, :H, :W]
+
+class NAFNetSR(nn.Module):
+    def __init__(self, sf=2, width=32, middle_blk_num=12,
+                 enc_blk_nums=(2, 2, 4, 8), dec_blk_nums=(2, 2, 2, 2),
+                 in_channels=1, drop_out_rate=0.0):
+        super().__init__()
+        self.sf = sf
+        self.body = NAFNetBody(in_channels=in_channels, out_channels=width,
+                               width=width, middle_blk_num=middle_blk_num,
+                               enc_blk_nums=enc_blk_nums, dec_blk_nums=dec_blk_nums,
+                               drop_out_rate=drop_out_rate)
+        if sf > 1:
+            self.head = nn.Sequential(
+                nn.Conv2d(width, width * 2, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(width * 2, width * sf * sf, 3, padding=1),
+                nn.PixelShuffle(sf),
+                nn.Conv2d(width, width, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(width, 1, 3, padding=1))
+        else:
+            self.head = nn.Sequential(
+                nn.Conv2d(width, width, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(width, 1, 3, padding=1))
+
+    def forward(self, x):
+        base = (F.interpolate(x, scale_factor=self.sf, mode='bilinear',
+                              align_corners=False) if self.sf > 1 else x)
+        return self.head(self.body(x)) + base
+
+def enable_tlc(model, train_patch):
+    n = 0
+    for m in model.modules():
+        if isinstance(m, LocalAvgPool2d):
+            m.base_size = train_patch
+            n += 1
+    for depth, stage in enumerate(getattr(model.body, 'encoders', [])):
+        for blk in stage.modules():
+            if isinstance(blk, LocalAvgPool2d):
+                blk.base_size = max(4, train_patch // (2 ** depth))
+    return n
+
+# ==============================================================================
+# 2. UTILITY FUNCTIONS
+# ==============================================================================
+
+def to_hw(a):
+    a = np.asarray(a)
+    if a.ndim == 2: return a
+    if a.ndim == 3:
+        if a.shape[0] == 1: return a[0]
+        if a.shape[2] == 1: return a[:, :, 0]
+    raise ValueError(f'Unsupported shape {a.shape}')
+
+def load_weights_from_zip(zip_path, device):
+    """Extracts the zip, finds the model weights, and repackages if needed."""
+    print(f"Loading weights from {zip_path}...")
+    temp_dir = tempfile.mkdtemp()
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    
+    for root, dirs, files in os.walk(temp_dir):
+        for f in files:
+            if f.endswith('.pth'):
+                pth_path = os.path.join(root, f)
+                checkpoint = torch.load(pth_path, map_location=device)
+                shutil.rmtree(temp_dir)
+                return checkpoint
+    
+    data_pkl_dir = None
+    for root, dirs, files in os.walk(temp_dir):
+        if 'data.pkl' in files:
+            data_pkl_dir = root
+            break
+            
+    if data_pkl_dir:
+        repacked_pth = 'temp_repacked.pth'
+        with zipfile.ZipFile(repacked_pth, 'w', zipfile.ZIP_STORED) as zipf:
+            for r, _, f in os.walk(data_pkl_dir):
+                for file in f:
+                    file_path = os.path.join(r, file)
+                    rel_path = os.path.relpath(file_path, data_pkl_dir)
+                    arcname = os.path.join('archive', rel_path)
+                    zipf.write(file_path, arcname)
+        
+        checkpoint = torch.load(repacked_pth, map_location=device)
+        os.remove(repacked_pth)
+        shutil.rmtree(temp_dir)
+        return checkpoint
+        
+    shutil.rmtree(temp_dir)
+    raise FileNotFoundError("Could not find a valid .pth file in the zip.")
+
+# ==============================================================================
+# 3. INTERACTIVE INFERENCE PIPELINE
+# ==============================================================================
+
+# ==============================================================================
+# 3. INTERACTIVE INFERENCE PIPELINE
+# ==============================================================================
 
 def main():
+    # --- MODEL CONFIGURATION ---
+    zip_path = 'best.zip'   
+    width = 32
+    train_patch = 96
+    sf = 2
+    # ---------------------------
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("Initializing environment...")
+    
+    # 1. LOAD CHECKPOINT
+    if not os.path.exists(zip_path):
+        print(f"Error: Could not find '{zip_path}'. Make sure it's in the same folder as this script.")
+        return
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "NAFNet v3 inference "
-            "with TLC and optional "
-            "8-fold ensemble."
-        )
-    )
-
-    parser.add_argument(
-        "--ckpt",
-        required=True,
-        help="Path to the trained .pth checkpoint.",
-    )
-
-    parser.add_argument(
-        "--input",
-        required=True,
-        help=(
-            "Directory containing input "
-            "images/NPY files, or one file."
-        ),
-    )
-
-    parser.add_argument(
-        "--out",
-        default="results",
-        help="Output directory.",
-    )
-
-    parser.add_argument(
-        "--gt",
-        default=None,
-        help=(
-            "Optional directory containing "
-            "GT files for scoring."
-        ),
-    )
-
-    parser.add_argument(
-        "--no_tlc",
-        action="store_true",
-        help="Disable TLC.",
-    )
-
-    parser.add_argument(
-        "--no_ensemble",
-        action="store_true",
-        help="Disable 8-fold ensemble.",
-    )
-
-    parser.add_argument(
-        "--no_npy",
-        action="store_true",
-        help="Save only PNG outputs.",
-    )
-
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU inference.",
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help=(
-            "Process only the first N files. "
-            "0 means all files."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    # -----------------------------------------------------------------------
-    # Device
-    # -----------------------------------------------------------------------
-
-    device = (
-        "cpu"
-        if args.cpu
-        or not torch.cuda.is_available()
-        else "cuda"
-    )
-
-    save_npy = not args.no_npy
-
-    use_ensemble = not args.no_ensemble
-
-    use_tlc = not args.no_tlc
-
-    # -----------------------------------------------------------------------
-    # Load model
-    # -----------------------------------------------------------------------
-
-    model, sf, train_patch = build_model(
-        args.ckpt,
-        device,
-    )
-
-    # -----------------------------------------------------------------------
-    # TLC
-    # -----------------------------------------------------------------------
-
-    if use_tlc:
-
-        n = enable_tlc(
-            model,
-            train_patch,
-        )
-
-        print(
-            f"  TLC: enabled "
-            f"({n} blocks, "
-            f"window={train_patch}px LR)"
-        )
-
+    checkpoint = load_weights_from_zip(zip_path, device)
+    
+    model = NAFNetSR(sf=sf, width=width).to(device)
+    
+    if 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+        scale = checkpoint.get('scale', 255.0)
     else:
-
-        disable_tlc(
-            model
-        )
-
-        print(
-            "  TLC: disabled"
-        )
-
-    print(
-        f"  Ensemble: "
-        f"{'8-fold' if use_ensemble else 'disabled'}"
-    )
-
-    print(
-        f"  Device: {device}"
-    )
-
-    print()
-
-    # -----------------------------------------------------------------------
-    # Find input files
-    # -----------------------------------------------------------------------
-
-    input_path = Path(
-        args.input
-    )
-
-    if input_path.is_dir():
-
-        files = sorted(
-            p
-            for p in input_path.rglob("*")
-            if (
-                p.suffix.lower() in EXTS
-                and not p.name.startswith("._")
-            )
-        )
-
-    else:
-
-        files = [
-            input_path
-        ]
-
-    if args.limit:
-
-        files = files[
-            :args.limit
-        ]
-
-    if not files:
-
-        raise RuntimeError(
-            f"No supported images found at "
-            f"{input_path}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Output directory
-    # -----------------------------------------------------------------------
-
-    out_dir = Path(
-        args.out
-    )
-
-    out_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    gt_dir = (
-        Path(args.gt)
-        if args.gt
-        else None
-    )
-
-    # -----------------------------------------------------------------------
-    # Metric storage
-    # -----------------------------------------------------------------------
-
-    psnr_list = []
-    ssim_list = []
-    lpips_list = []
-    time_list = []
-
-    # -----------------------------------------------------------------------
-    # Inference
-    # -----------------------------------------------------------------------
-
-    for i, file_path in enumerate(
-        files
-    ):
-
-        lr = load_image(
-            file_path
-        )
-
-        x = torch.from_numpy(
-            lr
-        )[None, None].to(
-            device
-        )
-
-        # ---------------------------------------------------------------
-        # Forward pass
-        # ---------------------------------------------------------------
-
-        if device == "cuda":
-            torch.cuda.synchronize()
-
-        start_time = time.time()
-
-        if use_ensemble:
-
-            y = run_ensemble(
-                model,
-                x,
-            )
-
-        else:
-
-            y = run_single(
-                model,
-                x,
-            )
-
-        if device == "cuda":
-            torch.cuda.synchronize()
-
-        elapsed = (
-            time.time()
-            - start_time
-        )
-
-        time_list.append(
-            elapsed
-        )
-
-        # ---------------------------------------------------------------
-        # Convert prediction to numpy
-        # ---------------------------------------------------------------
-
-        pred = (
-            y[0, 0]
-            .clamp(0, 1)
-            .cpu()
-            .numpy()
-        )
-
-        # ---------------------------------------------------------------
-        # Save outputs
-        # ---------------------------------------------------------------
-
-        save_outputs(
-            pred,
-            out_dir / file_path.stem,
-            save_npy=save_npy,
-        )
-
-        line = (
-            f"[{i + 1:4d}/{len(files)}] "
-            f"{file_path.name:<30s}"
-            f"  {lr.shape} -> {pred.shape}"
-            f"  {elapsed * 1000:.0f} ms"
-        )
-
-        # ---------------------------------------------------------------
-        # Optional scoring
-        # ---------------------------------------------------------------
-
-        if gt_dir is not None:
-
-            import re
-
-            candidates = [
-                p
-                for p in gt_dir.iterdir()
-                if (
-                    p.suffix.lower() in EXTS
-                    and p.stem in (
-                        file_path.stem,
-                        re.sub(
-                            r"_\d+$",
-                            "",
-                            file_path.stem,
-                        ),
-                    )
-                )
-            ]
-
-            if candidates:
-
-                gt = load_image(
-                    candidates[0]
-                )
-
-                p_val = psnr(
-                    pred,
-                    gt,
-                )
-
-                s_val = ssim_score(
-                    pred,
-                    gt,
-                )
-
-                l_val = lpips_score(
-                    pred,
-                    gt,
-                    device,
-                )
-
-                psnr_list.append(
-                    p_val
-                )
-
-                ssim_list.append(
-                    s_val
-                )
-
-                lpips_list.append(
-                    l_val
-                )
-
-                line += (
-                    f"  PSNR {p_val:.2f}"
-                    f"  SSIM {s_val:.4f}"
-                    f"  LPIPS {l_val:.4f}"
-                )
-
-            else:
-
-                line += (
-                    "  [no GT match]"
-                )
-
-        print(line)
-
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-
-    print()
-
-    print(
-        f"Saved to: {out_dir}/"
-    )
-
-    print(
-        f"Speed: "
-        f"{np.mean(time_list) * 1000:.1f} ms/image "
-        f"(total {sum(time_list):.1f} s "
-        f"for {len(files)} images)"
-    )
-
-    if use_ensemble:
-
-        print(
-            "       "
-            "(8-fold ensemble enabled)"
-        )
-
-    # -----------------------------------------------------------------------
-    # Final metrics
-    # -----------------------------------------------------------------------
-
-    if psnr_list:
-
-        print()
-        print(
-            f"Scores "
-            f"({len(psnr_list)} images)"
-        )
-
-        print(
-            f"  PSNR  : "
-            f"{np.mean(psnr_list):.4f} dB "
-            f"(min {min(psnr_list):.2f}, "
-            f"max {max(psnr_list):.2f})"
-        )
-
-        print(
-            f"  SSIM  : "
-            f"{np.mean(ssim_list):.4f} "
-            f"(min {min(ssim_list):.4f}, "
-            f"max {max(ssim_list):.4f})"
-        )
-
-        print(
-            f"  LPIPS : "
-            f"{np.mean(lpips_list):.4f} "
-            f"(min {min(lpips_list):.4f}, "
-            f"max {max(lpips_list):.4f})"
-        )
-
-
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
+        model.load_state_dict(checkpoint)
+        scale = 255.0
+
+    model.eval()
+    enable_tlc(model, train_patch)
+    print("\n" + "="*50)
+    print(f"✅ Model successfully loaded on {device.upper()} and ready for inference!")
+    print("="*50 + "\n")
+
+    # 2. INTERACTIVE LOOP
+    while True:
+        print("Type 'q' or 'quit' to exit.")
+        raw_input = input("Drag and drop an image file here (or paste the path): ").strip()
+        
+        if raw_input.lower() in ['q', 'quit', 'exit']:
+            print("Exiting interactive mode. Goodbye!")
+            break
+            
+        # Remove quotes that terminals often add when drag-and-dropping files
+        img_path = raw_input.strip("\"'") 
+        p = Path(img_path)
+        
+        if not p.exists() or not p.is_file():
+            print(f"❌ Error: Could not find file at '{img_path}'. Please try again.\n")
+            continue
+            
+        if p.suffix.lower() not in ['.npy', '.png', '.jpg', '.jpeg']:
+            print(f"❌ Error: Unsupported file type ({p.suffix}). Please use .npy, .png, or .jpg.\n")
+            continue
+
+        print(f"Processing '{p.name}'...")
+
+        try:
+            with torch.no_grad():
+                # Load Data Based on File Type
+                if p.suffix.lower() == '.npy':
+                    lr_img = to_hw(np.load(p)).astype(np.float32) / scale
+                else:
+                    img = Image.open(p).convert('L') # Convert to Grayscale
+                    lr_img = np.array(img).astype(np.float32) / 255.0
+                
+                # Convert to Tensor [1, 1, H, W]
+                lr_tensor = torch.from_numpy(np.ascontiguousarray(lr_img)).unsqueeze(0).unsqueeze(0).to(device)
+                
+                # Forward Pass
+                out_tensor = model(lr_tensor)
+                
+                # Convert back to Numpy for visualization
+                out_img = out_tensor.squeeze().cpu().numpy()
+                out_img_scaled = np.clip(out_img, 0, 1)
+                
+                # Original image scaled for visualization
+                in_img_scaled = np.clip(lr_img, 0, 1)
+
+            # EXTRACT REAL DIMENSIONS (Height, Width)
+            in_h, in_w = in_img_scaled.shape
+            out_h, out_w = out_img_scaled.shape
+
+            # 3. DISPLAY THE INTERACTIVE PLOT
+            plt.style.use('dark_background') # Looks great for demo videos
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+            fig.canvas.manager.set_window_title(f"NAFNet Denoising Demo - {p.name}")
+            
+            # Subplot 1: Noisy Input with explicit dimensions
+            axes[0].imshow(in_img_scaled, cmap='gray')
+            axes[0].set_title(f"Noisy Input\n[{in_w} x {in_h} pixels]", fontsize=16, fontweight='bold', pad=15)
+            axes[0].axis('off')
+            
+            # Subplot 2: Restored Output with explicit dimensions
+            axes[1].imshow(out_img_scaled, cmap='gray')
+            axes[1].set_title(f"Restored & Upsampled Output\n[{out_w} x {out_h} pixels]", fontsize=16, fontweight='bold', pad=15, color='#00ffcc') # Added a slight color pop to emphasize the output
+            axes[1].axis('off')
+            
+            plt.tight_layout()
+            
+            print("Showing result window... (Close the window to process the next image)")
+            plt.show() # This pauses the terminal loop until you close the image window
+            print("\nReady for next image.")
+            
+        except Exception as e:
+            print(f"❌ An error occurred during processing: {e}\n")
+
+if __name__ == '__main__':
     main()
