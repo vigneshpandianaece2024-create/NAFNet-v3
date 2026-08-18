@@ -283,18 +283,14 @@ NumPy images can be converted to PNG using:
 
 utils/npy_to_png.py
 
-Example:
-
-python utils/npy_to_png.py \
-    --input results \
-    --output results_png
-
 For a single file:
 
 python utils/npy_to_png.py \
     --input results/image_001.npy \
     --output results_png/image_001.png
 Results
+
+Note : That the weights are given the model folder and a drive link is provided that stores the weights file.
 
 The main reported experiment uses a bilinear 2× reconstruction as the
 baseline.
